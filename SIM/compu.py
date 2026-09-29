@@ -1,102 +1,95 @@
-import os
+"""Build an image-and-title index in the exact order of the search catalog."""
 
-# --------------------------------------------------------------------
-# 1) 解决 OMP 多次初始化的问题
-# --------------------------------------------------------------------
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+from __future__ import annotations
 
 import json
-import traceback
-import faiss
-import torch
-import numpy as np
-from tqdm import tqdm
-from PIL import Image
-import open_clip
-import warnings
+import os
+import sys
+from dataclasses import asdict
 from pathlib import Path
-import hashlib
 
-warnings.filterwarnings("ignore", category=FutureWarning, module="timm")
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+import faiss
+import numpy as np
+import open_clip
+import torch
+from PIL import Image
+from tqdm import tqdm
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from fyp.artifacts import (
+    ArtifactManifest,
+    resolve_image_path,
+    validate_catalog_metadata,
+    validate_index_rows,
+    validate_normalized_vectors,
+)
+
 
 class EmbeddingBuilder:
+    MODEL_NAME = "ViT-L-14"
+    PRETRAINED = "openai"
+
     def __init__(self):
-        project_root = Path(__file__).resolve().parents[1]
         self.META_JSON = Path(
-            os.environ.get('FYP_ITEMS_META', project_root / 'Search' / 'items_meta.json')
+            os.environ.get("FYP_ITEMS_META", PROJECT_ROOT / "Search" / "items_meta.json")
         ).resolve()
-        self.IMAGES_DIR = Path(
-            os.environ.get('FYP_IMAGE_DIR', project_root / 'dataset' / 'images')
-        ).resolve()
+        self.DATA_DIR = Path(os.environ.get("FYP_DATA_DIR", PROJECT_ROOT / "dataset")).resolve()
         self.SAVE_DIR = Path(
-            os.environ.get('PRODUCT_CONTENT_DIR', project_root / 'SIM')
+            os.environ.get("PRODUCT_CONTENT_DIR", PROJECT_ROOT / "SIM")
         ).resolve()
-
-        # 输出的 FAISS 索引文件 和 embeddings 矩阵文件
-        self.INDEX_PATH = os.path.join(self.SAVE_DIR, "faiss_index_sim.index")
-        self.EMB_PATH   = os.path.join(self.SAVE_DIR, "embeddings_sim.npy")
-
-        # 设备
+        self.INDEX_PATH = self.SAVE_DIR / "faiss_index_sim.index"
+        self.EMB_PATH = self.SAVE_DIR / "embeddings_sim.npy"
+        self.SEARCH_INDEX_PATH = self.META_JSON.parent / "faiss_index.index"
+        self.SEARCH_EMB_PATH = self.META_JSON.parent / "image_embeddings.npy"
         self.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+        self.items_meta: list[dict] = []
+        self.embeddings: list[np.ndarray | None] = []
 
-        # 初始化空变量
-        self.model = None
-        self.tokenizer = None
-        self.items_meta = []
-        self.embeddings = []
-
-        self.init_clip_model()
         self.load_data()
-
-    def init_clip_model(self):
-        """加载 OpenCLIP 模型和 tokenizer。"""
-        try:
-            self.model, _, self.img_transform = open_clip.create_model_and_transforms(
-                'ViT-L-14',
-                pretrained='openai',
-                device=self.DEVICE
-            )
-            self.tokenizer = open_clip.get_tokenizer('ViT-L-14')
-            self.model.eval()
-            print("Successfully initialized OpenCLIP model.")
-        except Exception as e:
-            print(f"Error loading OpenCLIP model: {e}")
-            traceback.print_exc()
-            raise
+        self.init_clip_model()
 
     def load_data(self):
-        """加载 items_meta.json 并规范化图像路径。"""
-        if not os.path.exists(self.META_JSON):
-            raise FileNotFoundError(f"{self.META_JSON} not found.")
+        if not self.META_JSON.is_file():
+            raise FileNotFoundError(f"Search catalog is missing: {self.META_JSON}")
+        self.items_meta = json.loads(self.META_JSON.read_text(encoding="utf-8"))
+        validate_catalog_metadata(self.items_meta)
 
-        with open(self.META_JSON, 'r', encoding='utf-8') as f:
-            self.items_meta = json.load(f)
-        print(f"Loaded items_meta with {len(self.items_meta)} items.")
+        for path in (self.SEARCH_INDEX_PATH, self.SEARCH_EMB_PATH):
+            if not path.is_file():
+                raise FileNotFoundError(f"Search artifact is missing: {path}; rebuild search index")
+        search_vectors = np.load(self.SEARCH_EMB_PATH, mmap_mode="r")
+        if search_vectors.ndim != 2:
+            raise ValueError("Search embeddings must be a two-dimensional matrix")
+        expected_shape = (len(self.items_meta), search_vectors.shape[1])
+        if search_vectors.shape != expected_shape:
+            raise ValueError("Search embeddings and metadata have different item counts")
+        validate_normalized_vectors(search_vectors, "search embeddings")
 
-        # 处理 image_path，使其位于 self.IMAGES_DIR 下
-        for idx, item in enumerate(self.items_meta):
-            original_path = item.get('image_path', "")
-            if not original_path:
-                continue
-            if os.path.isabs(original_path):
-                # 如果是绝对路径，但是不在 IMAGES_DIR 下，仅做提示
-                if not os.path.normpath(original_path).lower().startswith(
-                    os.path.normpath(self.IMAGES_DIR).lower()
-                ):
-                    print(f"[Warning] item {idx}: {original_path} not under IMAGES_DIR.")
-                item['image_path'] = os.path.normpath(original_path)
-            else:
-                # 相对路径 => 拼接到 IMAGES_DIR
-                new_path = os.path.join(self.IMAGES_DIR, original_path)
-                item['image_path'] = os.path.normpath(new_path)
+        search_index = faiss.read_index(str(self.SEARCH_INDEX_PATH))
+        validate_index_rows(search_index, search_vectors, "search index")
+        print(f"Loaded and checked {len(self.items_meta)} ordered search items")
+
+    def init_clip_model(self):
+        self.model, _, self.img_transform = open_clip.create_model_and_transforms(
+            self.MODEL_NAME, pretrained=self.PRETRAINED, device=self.DEVICE
+        )
+        self.tokenizer = open_clip.get_tokenizer(self.MODEL_NAME)
+        self.model.eval()
 
     def compute_embeddings(self):
-        """计算图像 + 文本融合向量，并存到 self.embeddings."""
+        batch_size = int(os.environ.get("FYP_EMBEDDING_BATCH_SIZE", "64"))
+        if batch_size < 1:
+            raise ValueError("FYP_EMBEDDING_BATCH_SIZE must be positive")
         self.embeddings = [None] * len(self.items_meta)
-        batch_size = int(os.environ.get('FYP_EMBEDDING_BATCH_SIZE', '64'))
-        batch_indices = []
+        batch_indices: list[int] = []
         image_tensors = []
-        titles = []
+        titles: list[str] = []
 
         def flush_batch():
             if not batch_indices:
@@ -107,89 +100,71 @@ class EmbeddingBuilder:
                 image_features = self.model.encode_image(image_batch)
                 text_features = self.model.encode_text(text_tokens)
                 fused = 0.5 * image_features + 0.5 * text_features
-                fused = fused / fused.norm(dim=-1, keepdim=True)
+                fused = torch.nn.functional.normalize(fused, dim=-1)
             for item_index, embedding in zip(batch_indices, fused.cpu().numpy()):
-                self.embeddings[item_index] = embedding
+                self.embeddings[item_index] = embedding.astype(np.float32)
             batch_indices.clear()
             image_tensors.clear()
             titles.clear()
 
-        for idx, item in enumerate(tqdm(self.items_meta, desc="Computing embeddings")):
-            img_path = item.get('image_path', "")
-            if not img_path or not os.path.exists(img_path):
-                continue
-
-            title = item.get('title', "")
-
+        for idx, item in enumerate(tqdm(self.items_meta, desc="Computing content embeddings")):
             try:
-                with Image.open(img_path) as source:
-                    image_tensors.append(self.img_transform(source.convert('RGB')))
-                batch_indices.append(idx)
-                titles.append(title)
-                if len(batch_indices) >= batch_size:
-                    flush_batch()
-            except Exception as e:
-                print(f"[Error] item {idx}, path={img_path}, title={title}: {e}")
-                traceback.print_exc()
+                image_path, _ = resolve_image_path(item["image_path"], self.DATA_DIR)
+                with Image.open(image_path) as source:
+                    image_tensors.append(self.img_transform(source.convert("RGB")))
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Cannot build aligned content index: image for {item['asin']} "
+                    f"at metadata row {idx} is unavailable"
+                ) from exc
+            batch_indices.append(idx)
+            titles.append(str(item.get("title") or ""))
+            if len(batch_indices) >= batch_size:
+                flush_batch()
         flush_batch()
+        if any(embedding is None for embedding in self.embeddings):
+            raise RuntimeError("Some products have no content embedding")
 
     def build_faiss_index(self):
-        """将 self.embeddings 写入 FAISS 索引并保存到磁盘。"""
-        valid_embeddings = [x for x in self.embeddings if x is not None]
-        if not valid_embeddings:
-            print("No valid embeddings to build index.")
-            return
+        if len(self.embeddings) != len(self.items_meta) or not self.embeddings:
+            raise ValueError("Content embeddings must match the ordered catalog")
+        matrix = np.asarray(self.embeddings, dtype=np.float32)
+        validate_normalized_vectors(matrix, "content embeddings")
+        index = faiss.IndexFlatIP(matrix.shape[1])
+        index.add(matrix)
 
-        d = valid_embeddings[0].shape[0]   # 向量维度
-        index = faiss.IndexFlatIP(d)       # InnerProduct => 归一化后可视为余弦相似
+        self.SAVE_DIR.mkdir(parents=True, exist_ok=True)
+        faiss.write_index(index, str(self.INDEX_PATH))
+        np.save(self.EMB_PATH, matrix)
 
-        full_embeddings = [
-            embedding if embedding is not None else np.zeros(d, dtype=np.float32)
-            for embedding in self.embeddings
-        ]
-        emb_matrix = np.asarray(full_embeddings, dtype=np.float32)
-        faiss.normalize_L2(emb_matrix)
-        index.add(emb_matrix)
-
-        # 保存索引
-        faiss.write_index(index, self.INDEX_PATH)
-        print(f"FAISS index built with {index.ntotal} vectors => {self.INDEX_PATH}")
-
-        np.save(self.EMB_PATH, emb_matrix)
-        print(f"Saved embeddings to {self.EMB_PATH}")
-
-        digest = hashlib.sha256()
-        with self.META_JSON.open('rb') as metadata_source:
-            while chunk := metadata_source.read(1024 * 1024):
-                digest.update(chunk)
-        dataset_hash = digest.hexdigest()
-        search_index = self.META_JSON.parent / 'faiss_index.index'
-        manifest = {
-            'schema_version': 1,
-            'dataset_sha256': dataset_hash,
-            'model_name': 'ViT-L-14',
-            'pretrained': 'openai',
-            'embedding_dimension': d,
-            'item_count': len(self.items_meta),
-            'metadata_path': os.path.relpath(self.META_JSON, self.SAVE_DIR),
-            'search_index_path': os.path.relpath(search_index, self.SAVE_DIR),
-            'content_index_path': os.path.basename(self.INDEX_PATH),
-            'content_embeddings_path': os.path.basename(self.EMB_PATH),
-        }
-        manifest_path = self.SAVE_DIR / 'manifest.json'
-        manifest_path.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8'
+        manifest = ArtifactManifest.from_files(
+            base_dir=self.SAVE_DIR,
+            metadata_path=self.META_JSON,
+            search_index_path=self.SEARCH_INDEX_PATH,
+            search_embeddings_path=self.SEARCH_EMB_PATH,
+            content_index_path=self.INDEX_PATH,
+            content_embeddings_path=self.EMB_PATH,
+            model_name=self.MODEL_NAME,
+            pretrained=self.PRETRAINED,
+            embedding_dimension=matrix.shape[1],
+            item_count=len(self.items_meta),
         )
-        print(f"Saved artifact manifest to {manifest_path}")
+        manifest_path = self.SAVE_DIR / "manifest.json"
+        pending_path = self.SAVE_DIR / "manifest.pending.json"
+        try:
+            pending_path.write_text(
+                json.dumps(asdict(manifest), ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            ArtifactManifest.load(pending_path)
+            pending_path.replace(manifest_path)
+        finally:
+            pending_path.unlink(missing_ok=True)
+        print(f"Saved validated artifact manifest to {manifest_path}")
 
     def run(self):
-        """一次性执行：Compute Embeddings + Build Index."""
         self.compute_embeddings()
         self.build_faiss_index()
 
 
 if __name__ == "__main__":
-    builder = EmbeddingBuilder()
-    os.makedirs(builder.SAVE_DIR, exist_ok=True)
-    builder.run()
-    print("Done. Embeddings + FAISS index saved.")
+    EmbeddingBuilder().run()

@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "dataset_sha256": "replace-with-processed-dataset-hash",
   "model_name": "ViT-L-14",
   "pretrained": "openai",
@@ -7,6 +7,11 @@
   "item_count": 0,
   "metadata_path": "items_meta.json",
   "search_index_path": "search.index",
+  "search_embeddings_path": "search_embeddings.npy",
   "content_index_path": "content.index",
-  "content_embeddings_path": "content_embeddings.npy"
+  "content_embeddings_path": "content_embeddings.npy",
+  "search_index_sha256": "replace-with-search-index-hash",
+  "search_embeddings_sha256": "replace-with-search-embeddings-hash",
+  "content_index_sha256": "replace-with-content-index-hash",
+  "content_embeddings_sha256": "replace-with-content-embeddings-hash"
 }

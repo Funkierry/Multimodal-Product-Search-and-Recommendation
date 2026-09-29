@@ -42,5 +42,9 @@ reviews_data.json
 updated_items_meta.json
 results/
 Search/items_meta.json
+Search/items_meta.legacy.json
+Search/items_meta.pending.json
+Search/image_embeddings.pending.npy
 Preprocess/NumOfClass.sh
 SIM/manifest.json
+SIM/manifest.pending.json

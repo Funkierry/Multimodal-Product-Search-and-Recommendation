@@ -40,6 +40,7 @@ dev = [
 
 [project.scripts]
 fyp-audit = "fyp.cli:main"
+fyp-migrate-artifacts = "fyp.migrate:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

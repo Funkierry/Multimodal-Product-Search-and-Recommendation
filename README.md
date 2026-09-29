@@ -24,9 +24,10 @@ python -m spacy download en_core_web_sm
 ```
 
 Large generated files are intentionally excluded from Git. Place datasets under
-`dataset/` and generated model/index files under `artifacts/`. Copy
-`artifacts/manifest.example.json` to `artifacts/manifest.json` and update it when an
-artifact set is built.
+`dataset/`. The legacy builders write the search index and ordered catalog to
+`Search/`, then the content index and validated manifest to `SIM/`. The two builders
+must run in that order. `FYP_DATA_DIR` can relocate the source dataset; keep its value
+the same when building indexes and running the desktop app.
 
 ## Expected data
 
@@ -57,9 +58,24 @@ fyp-audit --manifest SIM/manifest.json
 Build the exact text-to-image index, then the image-and-title content index:
 
 ```powershell
-python Search/searchV.py
+python Search/searchV.py --rebuild --build-only
 python SIM/compu.py
 ```
+
+The builders require unique ASINs and readable images. Catalog image paths are saved
+relative to `FYP_DATA_DIR`; missing images during the content build stop the build
+instead of producing zero vectors. Artifacts produced before manifest schema 2 must
+be rebuilt or migrated before starting the desktop app. To migrate existing exact
+Faiss indexes without rerunning OpenCLIP, use the original dataset directory:
+
+```powershell
+fyp-migrate-artifacts --data-dir "D:\path\to\original\dataset"
+```
+
+Migration checks all image paths, index rows, and content vectors. It keeps the old
+metadata as `Search/items_meta.legacy.json` and writes the new search embedding
+matrix and `SIM/manifest.json`. The source dataset can stay outside this repository;
+set `FYP_DATA_DIR` to the same directory when launching the app.
 
 Train and evaluate the offline ResNet50+BERT category classifier:
 

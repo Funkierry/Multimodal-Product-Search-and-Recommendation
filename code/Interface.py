@@ -29,6 +29,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from fyp.artifacts import ArtifactManifest, resolve_image_path
 from fyp.config import ProjectPaths, search_candidate_count
 from fyp.recommendation.collaborative import InteractionRecommender
 from fyp.scoring import similarity_percent
@@ -428,8 +429,7 @@ class ProductSearchSystem:
         ).expanduser().resolve()
         self.CONTENT_INDEX_PATH = self.CONTENT_DIR / "faiss_index_sim.index"
         self.EMB_PATH = self.CONTENT_DIR / "embeddings_sim.npy"
-        if not self.EMB_PATH.exists():
-            self.EMB_PATH = self.SEARCH_DIR / "embeddings_sim.npy"
+        self.MANIFEST_PATH = self.CONTENT_DIR / "manifest.json"
 
         self.MODEL_NAME = "ViT-L-14"
         self.PRETRAINED = "openai"
@@ -447,8 +447,8 @@ class ProductSearchSystem:
         self.load_success = False
 
         try:
-            self.init_model()
             self.load_data()
+            self.init_model()
             self.load_success = True
             # Create ASIN to index mapping for faster lookups
             self.asin_to_metadata_map = {item.get('asin') or item.get('ASIN'): item
@@ -500,6 +500,18 @@ class ProductSearchSystem:
 
     def load_data(self):
         print("Loading search index, metadata, and embeddings...")
+        if not self.MANIFEST_PATH.is_file():
+            raise FileNotFoundError(
+                f"Artifact manifest not found: {self.MANIFEST_PATH}. "
+                "Rebuild with Search/searchV.py and SIM/compu.py."
+            )
+        manifest = ArtifactManifest.load(self.MANIFEST_PATH)
+        self.MODEL_NAME = manifest.model_name
+        self.PRETRAINED = manifest.pretrained
+        self.INDEX_PATH = str(self.CONTENT_DIR / manifest.search_index_path)
+        self.META_JSON = str(self.CONTENT_DIR / manifest.metadata_path)
+        self.CONTENT_INDEX_PATH = self.CONTENT_DIR / manifest.content_index_path
+        self.EMB_PATH = self.CONTENT_DIR / manifest.content_embeddings_path
         if not os.path.exists(self.INDEX_PATH):
              raise FileNotFoundError(f"Faiss index not found: {self.INDEX_PATH}")
         self.index = faiss.read_index(self.INDEX_PATH)
@@ -510,15 +522,16 @@ class ProductSearchSystem:
         with open(self.META_JSON, 'r', encoding='utf-8') as f:
             self.items_meta = json.load(f)
         print(f"Loaded metadata for {len(self.items_meta)} items.")
+        for item in self.items_meta:
+            item['image_path'] = str(
+                resolve_image_path(item['image_path'], PROJECT_PATHS.data_dir)[0]
+            )
 
-        if self.CONTENT_INDEX_PATH.exists():
-            self.content_index = faiss.read_index(str(self.CONTENT_INDEX_PATH))
-        else:
-            self.content_index = self.index
+        self.content_index = faiss.read_index(str(self.CONTENT_INDEX_PATH))
 
         if not os.path.exists(self.EMB_PATH):
             raise FileNotFoundError(f"Embeddings file not found: {self.EMB_PATH}")
-        self.embeddings = np.load(self.EMB_PATH).astype('float32')
+        self.embeddings = np.load(self.EMB_PATH, mmap_mode='r')
         print(f"Loaded embeddings array with shape: {self.embeddings.shape}")
 
         counts = {

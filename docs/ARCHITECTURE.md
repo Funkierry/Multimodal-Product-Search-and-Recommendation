@@ -20,7 +20,10 @@ flowchart LR
 
 The desktop UI consumes services and generated artifacts. It does not train models or
 silently download NLP models. Generated files are tied together by a manifest that
-records model identity, vector dimensions, item count, and a metadata checksum.
+records model identity, vector dimensions, item count, ordered catalog checksum, and
+checksums for both indexes and embedding matrices. Every index row has the same ASIN
+as the metadata row at that position. A failed content image build stops instead of
+inserting a zero vector. Catalog paths remain relative to the configured data directory.
 
 ## Retrieval
 

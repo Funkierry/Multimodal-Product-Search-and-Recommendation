@@ -1,5 +1,7 @@
+import argparse
 import os
 import json
+import sys
 import faiss
 import torch
 import pandas as pd
@@ -15,6 +17,16 @@ from pathlib import Path
 
 # Base Configuration
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / 'src'
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from fyp.artifacts import (
+    resolve_image_path,
+    validate_catalog_metadata,
+    validate_normalized_vectors,
+)
+
 BASE_DIR = Path(os.environ.get('FYP_DATA_DIR', PROJECT_ROOT / 'dataset')).resolve()
 SEARCH_DIR = Path(
     os.environ.get('PRODUCT_SEARCH_DIR', PROJECT_ROOT / 'Search')
@@ -25,8 +37,6 @@ os.makedirs(SEARCH_DIR, exist_ok=True)
 TRAIN_CSV = os.path.join(BASE_DIR, 'train_updated.csv')
 VAL_CSV = os.path.join(BASE_DIR, 'val_updated.csv')
 TEST_CSV = os.path.join(BASE_DIR, 'test_updated.csv')
-IMG_DIR = BASE_DIR
-
 # Output paths
 INDEX_PATH = os.path.join(SEARCH_DIR, "faiss_index.index")
 META_JSON = os.path.join(SEARCH_DIR, "items_meta.json")
@@ -38,6 +48,10 @@ PRETRAINED = "openai"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 TOP_K = 5
 BUILD_BATCH_SIZE = int(os.environ.get('FYP_EMBEDDING_BATCH_SIZE', '64'))
+
+
+class DuplicateAsinError(ValueError):
+    pass
 
 def read_csv_safely(file_path: str) -> pd.DataFrame:
     print(f"[INFO] Reading CSV file: {os.path.basename(file_path)}")
@@ -101,12 +115,11 @@ def build_faiss_index(model, preprocess, tokenizer, csv_files: List[str], index_
     print("[INFO] Merging datasets...")
     with tqdm(total=1, desc="Merging data") as pbar:
         combined_df = pd.concat(all_dfs, ignore_index=True)
-        combined_df['full_img_path'] = combined_df['imgUrl'].apply(
-            lambda p: os.path.join(IMG_DIR, p))
         pbar.update(1)
 
     items_meta = []
     image_embeddings = []
+    seen_asins = set()
 
     total_items = len(combined_df)
     print(f"[INFO] Processing {total_items} items...")
@@ -119,12 +132,21 @@ def build_faiss_index(model, preprocess, tokenizer, csv_files: List[str], index_
             valid_rows = []
             for _, row in batch.iterrows():
                 try:
-                    img_path = row['full_img_path']
+                    asin = row.get('asin')
+                    if pd.isna(asin) or not str(asin).strip():
+                        raise ValueError('ASIN is missing')
+                    asin = str(asin).strip()
+                    if asin in seen_asins:
+                        raise DuplicateAsinError(f'Duplicate ASIN in source data: {asin}')
+                    img_path, relative_img_path = resolve_image_path(row.get('imgUrl'), BASE_DIR)
                     with Image.open(img_path) as source:
                         tensors.append(preprocess(source.convert("RGB")))
-                    valid_rows.append(row)
+                    valid_rows.append((row, asin, relative_img_path))
+                    seen_asins.add(asin)
+                except DuplicateAsinError:
+                    raise
                 except Exception as error:
-                    progress_bar.write(f"Error with {row.get('asin', 'unknown')}: {error}")
+                    progress_bar.write(f"Skipping {row.get('asin', 'unknown')}: {error}")
                 finally:
                     progress_bar.update(1)
 
@@ -133,7 +155,7 @@ def build_faiss_index(model, preprocess, tokenizer, csv_files: List[str], index_
             image_batch = torch.stack(tensors).to(DEVICE)
             features = model.encode_image(image_batch)
             features = features / features.norm(dim=-1, keepdim=True)
-            for row, feature in zip(valid_rows, features.cpu().numpy()):
+            for (row, asin, relative_img_path), feature in zip(valid_rows, features.cpu().numpy()):
                 image_embeddings.append(feature)
                 meta = {}
                 for key in [
@@ -142,7 +164,8 @@ def build_faiss_index(model, preprocess, tokenizer, csv_files: List[str], index_
                 ]:
                     value = row.get(key, '')
                     meta[key] = '' if pd.isna(value) else value.item() if hasattr(value, 'item') else value
-                meta['image_path'] = str(row['full_img_path'])
+                meta['asin'] = asin
+                meta['image_path'] = relative_img_path
                 items_meta.append(meta)
 
         progress_bar.close()
@@ -154,6 +177,8 @@ def build_faiss_index(model, preprocess, tokenizer, csv_files: List[str], index_
     with tqdm(total=1, desc="Converting embeddings") as pbar:
         image_embeddings = np.array(image_embeddings, dtype=np.float32)
         pbar.update(1)
+    validate_catalog_metadata(items_meta)
+    validate_normalized_vectors(image_embeddings, 'search embeddings')
 
     print(f"[INFO] Building Faiss index with dimension {image_embeddings.shape[1]}...")
     with tqdm(total=2, desc="Building index") as pbar:
@@ -185,6 +210,9 @@ def load_index():
         with open(META_JSON, "r", encoding="utf-8") as f:
             items_meta = json.load(f)
         pbar.update(1)
+    validate_catalog_metadata(items_meta)
+    if index.ntotal != len(items_meta):
+        raise ValueError('Search index and metadata counts differ; rebuild the search index')
     return index, items_meta
 
 def search_products(query: str, model, tokenizer, index, items_meta, top_k=TOP_K):
@@ -242,7 +270,8 @@ class ProductSearchGUI:
 
     def display_result(self, result_frame, score, item):
         try:
-            img = Image.open(item["image_path"]).convert("RGB")
+            img_path, _ = resolve_image_path(item["image_path"], BASE_DIR)
+            img = Image.open(img_path).convert("RGB")
             img.thumbnail((100, 100))
             photo = ImageTk.PhotoImage(img)
             img_label = ttk.Label(result_frame, image=photo)
@@ -294,6 +323,10 @@ class ProductSearchGUI:
         self.progress_var.set(100)
 
 def main():
+    parser = argparse.ArgumentParser(description="Build or run the product search index")
+    parser.add_argument('--rebuild', action='store_true', help='Rebuild search artifacts')
+    parser.add_argument('--build-only', action='store_true', help='Exit after building/loading')
+    args = parser.parse_args()
     print("[INFO] Starting product search system...")
 
     # Create search directory if not exists
@@ -307,10 +340,16 @@ def main():
     csv_files = [TRAIN_CSV, VAL_CSV, TEST_CSV]
 
     # Load or build index
-    index, items_meta = load_index()
+    if args.rebuild:
+        index, items_meta = build_faiss_index(model, preprocess, tokenizer, csv_files)
+    else:
+        index, items_meta = load_index()
     if index is None:
         print("[INFO] No existing index found, building new index...")
         index, items_meta = build_faiss_index(model, preprocess, tokenizer, csv_files)
+
+    if args.build_only:
+        return
 
     # Start GUI
     root = ThemedTk(theme="arc")
