@@ -1,13 +1,6 @@
-dataset/amz_uk_processed_data.csv filter=lfs diff=lfs merge=lfs -text
-dataset/Items.csv filter=lfs diff=lfs merge=lfs -text
-dataset/test_updated.csv filter=lfs diff=lfs merge=lfs -text
-dataset/test.csv filter=lfs diff=lfs merge=lfs -text
-dataset/testCounts.csv filter=lfs diff=lfs merge=lfs -text
-dataset/train_updated.csv filter=lfs diff=lfs merge=lfs -text
-dataset/train.csv filter=lfs diff=lfs merge=lfs -text
-dataset/trainCounts.csv filter=lfs diff=lfs merge=lfs -text
-dataset/Users.csv filter=lfs diff=lfs merge=lfs -text
-dataset/val_updated.csv filter=lfs diff=lfs merge=lfs -text
-dataset/val.csv filter=lfs diff=lfs merge=lfs -text
-dataset/valCounts.csv filter=lfs diff=lfs merge=lfs -text
-Search/faiss_index.index filter=lfs diff=lfs merge=lfs -text
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pdf binary

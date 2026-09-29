@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "dataset_sha256": "replace-with-processed-dataset-hash",
+  "model_name": "ViT-L-14",
+  "pretrained": "openai",
+  "embedding_dimension": 768,
+  "item_count": 0,
+  "metadata_path": "items_meta.json",
+  "search_index_path": "search.index",
+  "content_index_path": "content.index",
+  "content_embeddings_path": "content_embeddings.npy"
+}

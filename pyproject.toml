@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fyp-product-recommendation"
+version = "0.1.0"
+description = "Multimodal product search and recommendation research prototype"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+  "numpy>=1.26,<3",
+  "pandas>=2.2,<3",
+  "Pillow>=10,<12",
+  "requests>=2.32,<3",
+  "scikit-learn>=1.4,<2",
+  "tqdm>=4.66,<5",
+]
+
+[project.optional-dependencies]
+ml = [
+  "faiss-cpu>=1.8,<2",
+  "open-clip-torch>=2.26,<3",
+  "torch>=2.3,<3",
+  "torchvision>=0.18,<1",
+  "transformers>=4.42,<5",
+]
+ui = [
+  "customtkinter>=5.2,<6",
+  "matplotlib>=3.8,<4",
+  "spacy>=3.7,<4",
+  "ttkthemes>=3.2,<4",
+  "vaderSentiment>=3.3,<4",
+  "wordcloud>=1.9,<2",
+]
+dev = [
+  "pytest>=8,<9",
+  "ruff>=0.6,<1",
+]
+
+[project.scripts]
+fyp-audit = "fyp.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
