@@ -41,6 +41,8 @@ dev = [
 [project.scripts]
 fyp-audit = "fyp.cli:main"
 fyp-migrate-artifacts = "fyp.migrate:main"
+fyp-evaluate-recommendations = "fyp.evaluation.cli:recommendation_main"
+fyp-evaluate-search = "fyp.evaluation.cli:search_main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

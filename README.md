@@ -55,6 +55,17 @@ Audit a generated artifact set:
 fyp-audit --manifest SIM/manifest.json
 ```
 
+Evaluate the interaction-based recommender against popularity and same-category
+baselines using the project's simulated interaction file:
+
+```powershell
+$env:FYP_DATA_DIR = "D:\path\to\original\dataset"
+fyp-evaluate-recommendations
+```
+
+See `docs/EVALUATION.md` for the reported baseline, the search judgment format, and
+the limits of these offline measurements.
+
 Build the exact text-to-image index, then the image-and-title content index:
 
 ```powershell
