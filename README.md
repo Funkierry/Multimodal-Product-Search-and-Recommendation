@@ -48,6 +48,9 @@ $env:PYTHONPATH = "src"
 python -m unittest discover -s tests -v
 ```
 
+GitHub CI runs these tests and checks all installed command-line entry points on
+Python 3.10, 3.11, and 3.12.
+
 Audit a generated artifact set:
 
 ```powershell

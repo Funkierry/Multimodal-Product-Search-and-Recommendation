@@ -10,8 +10,8 @@ readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [
   "numpy>=1.26,<3",
-  "pandas>=2.2,<3",
-  "Pillow>=10,<12",
+  "pandas>=2.2,<4",
+  "Pillow>=10,<13",
   "requests>=2.32,<3",
   "scikit-learn>=1.4,<2",
   "tqdm>=4.66,<5",
