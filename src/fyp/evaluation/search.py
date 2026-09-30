@@ -7,6 +7,8 @@ from pathlib import Path
 
 import numpy as np
 
+from fyp.config import faiss_search_threads
+
 from .metrics import mean_metrics, ranking_metrics
 
 
@@ -125,6 +127,7 @@ def collect_openclip_rankings(
     validate_judgments(judgments)
     if top_k < 1 or candidate_count < top_k:
         raise ValueError("top_k must be positive and no larger than candidate_count")
+    faiss.omp_set_num_threads(faiss_search_threads())
     load_start = time.perf_counter()
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     index = faiss.read_index(str(index_path))

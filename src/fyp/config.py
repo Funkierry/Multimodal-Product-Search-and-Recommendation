@@ -45,3 +45,14 @@ def search_candidate_count() -> int:
     if value < 1:
         raise ValueError("FYP_SEARCH_CANDIDATES must be positive")
     return value
+
+
+def faiss_search_threads() -> int:
+    raw_value = os.environ.get("FYP_FAISS_THREADS", "4")
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError("FYP_FAISS_THREADS must be an integer") from exc
+    if value < 1:
+        raise ValueError("FYP_FAISS_THREADS must be positive")
+    return value

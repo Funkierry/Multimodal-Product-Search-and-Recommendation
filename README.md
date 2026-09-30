@@ -126,6 +126,11 @@ The UI only reads `reviews_data.json`; it no longer loads spaCy or processes the
 review CSV during startup. The builder writes the JSON atomically after validating
 the source columns.
 
+Retrieval timing and memory measurements for the local catalog are in
+[the performance report](docs/PERFORMANCE.md). The UI checks artifact checksums at
+startup; run `fyp-audit --manifest SIM/manifest.json` for the full row-by-row index
+check after rebuilding artifacts.
+
 The legacy desktop entry point remains `code/Interface.py`. It requires the `ml` and
 `ui` extras and generated indexes. Training and final evaluation must use disjoint
 train, validation, and test sets; the test set is evaluated only after model selection.

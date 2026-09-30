@@ -24,6 +24,10 @@ records model identity, vector dimensions, item count, ordered catalog checksum,
 checksums for both indexes and embedding matrices. Every index row has the same ASIN
 as the metadata row at that position. A failed content image build stops instead of
 inserting a zero vector. Catalog paths remain relative to the configured data directory.
+At UI startup, the manifest verifies file checksums, metadata, vector shapes, and
+normalization. The full row-by-row index check runs via `fyp-audit` after artifact
+generation. The content index loads on the first similar-item request, so regular
+search does not keep both Faiss indexes in memory.
 
 ## Retrieval
 

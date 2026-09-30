@@ -17,7 +17,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from wordcloud import WordCloud
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -25,8 +25,8 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from fyp.artifacts import ArtifactManifest, resolve_image_path
-from fyp.config import ProjectPaths, search_candidate_count
+from fyp.artifacts import ArtifactManifest
+from fyp.config import ProjectPaths, faiss_search_threads, search_candidate_count
 from fyp.recommendation.collaborative import InteractionRecommender
 from fyp.reviews import load_review_summaries
 from fyp.scoring import similarity_percent
@@ -312,6 +312,7 @@ class ProductSearchSystem:
         self.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Using device: {self.DEVICE}")
         self.TOP_K = search_candidate_count()
+        faiss.omp_set_num_threads(faiss_search_threads())
 
         self.model = None
         self.preprocess = None
@@ -381,7 +382,9 @@ class ProductSearchSystem:
                 f"Artifact manifest not found: {self.MANIFEST_PATH}. "
                 "Rebuild with Search/searchV.py and SIM/compu.py."
             )
-        manifest = ArtifactManifest.load(self.MANIFEST_PATH)
+        # Runtime checks hashes, metadata, shapes, and vector norms. The full
+        # row-by-row index audit remains available through fyp-audit.
+        manifest = ArtifactManifest.load(self.MANIFEST_PATH, verify_index_rows=False)
         self.MODEL_NAME = manifest.model_name
         self.PRETRAINED = manifest.pretrained
         self.INDEX_PATH = str(self.CONTENT_DIR / manifest.search_index_path)
@@ -398,12 +401,20 @@ class ProductSearchSystem:
         with open(self.META_JSON, 'r', encoding='utf-8') as f:
             self.items_meta = json.load(f)
         print(f"Loaded metadata for {len(self.items_meta)} items.")
+        # The manifest has already checked every relative path for traversal.
+        # Resolve each image directory once rather than statting 198k image files.
+        image_directories = {}
         for item in self.items_meta:
-            item['image_path'] = str(
-                resolve_image_path(item['image_path'], PROJECT_PATHS.data_dir)[0]
-            )
-
-        self.content_index = faiss.read_index(str(self.CONTENT_INDEX_PATH))
+            parts = PurePosixPath(item['image_path'].replace('\\', '/')).parts
+            parent = parts[:-1]
+            if parent not in image_directories:
+                resolved = PROJECT_PATHS.data_dir.joinpath(*parent).resolve()
+                try:
+                    resolved.relative_to(PROJECT_PATHS.data_dir)
+                except ValueError as exc:
+                    raise ValueError(f"Image directory escapes the data directory: {parent}") from exc
+                image_directories[parent] = resolved
+            item['image_path'] = str(image_directories[parent] / parts[-1])
 
         if not os.path.exists(self.EMB_PATH):
             raise FileNotFoundError(f"Embeddings file not found: {self.EMB_PATH}")
@@ -412,9 +423,9 @@ class ProductSearchSystem:
 
         counts = {
             "search index": self.index.ntotal,
-            "content index": self.content_index.ntotal,
             "metadata": len(self.items_meta),
             "embeddings": self.embeddings.shape[0],
+            "manifest": manifest.item_count,
         }
         if len(set(counts.values())) != 1:
             raise ValueError(f"Artifact item-count mismatch: {counts}")
@@ -451,6 +462,12 @@ class ProductSearchSystem:
         query_emb = self.embeddings[item_idx : item_idx+1].copy()
         faiss.normalize_L2(query_emb)
         try:
+            if self.content_index is None:
+                content_index = faiss.read_index(str(self.CONTENT_INDEX_PATH))
+                if (content_index.ntotal != len(self.items_meta)
+                        or content_index.d != self.embeddings.shape[1]):
+                    raise ValueError("Content index shape differs from the validated manifest")
+                self.content_index = content_index
             distances, indices = self.content_index.search(query_emb, top_n + 1)
             results = []
             max_valid_index = len(self.items_meta)
