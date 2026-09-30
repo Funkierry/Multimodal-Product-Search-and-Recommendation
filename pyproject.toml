@@ -29,10 +29,12 @@ ml = [
 ui = [
   "customtkinter>=5.2,<6",
   "matplotlib>=3.8,<4",
-  "spacy>=3.7,<4",
   "ttkthemes>=3.2,<4",
-  "vaderSentiment>=3.3,<4",
   "wordcloud>=1.9,<2",
+]
+reviews = [
+  "spacy>=3.7,<4",
+  "vaderSentiment>=3.3,<4",
 ]
 dev = [
   "pytest>=8,<9",
@@ -44,6 +46,7 @@ fyp-audit = "fyp.cli:main"
 fyp-migrate-artifacts = "fyp.migrate:main"
 fyp-evaluate-recommendations = "fyp.evaluation.cli:recommendation_main"
 fyp-evaluate-search = "fyp.evaluation.cli:search_main"
+fyp-build-reviews = "fyp.reviews:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

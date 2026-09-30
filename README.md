@@ -20,7 +20,6 @@ py -3.11 -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install -U pip
 python -m pip install -e ".[ml,ui,dev]"
-python -m spacy download en_core_web_sm
 ```
 
 Large generated files are intentionally excluded from Git. Place datasets under
@@ -113,6 +112,19 @@ Start the desktop application after the retrieval artifacts are available:
 ```powershell
 python code/Interface.py
 ```
+
+Review aspect summaries are built offline. If `reviews_data.json` is absent, the UI
+still opens and shows a no-data message in the sentiment panel. To generate it:
+
+```powershell
+python -m pip install -e ".[reviews]"
+python -m spacy download en_core_web_sm
+fyp-build-reviews --input "D:\path\to\dataset\Dataset_Rec.csv" --output reviews_data.json
+```
+
+The UI only reads `reviews_data.json`; it no longer loads spaCy or processes the
+review CSV during startup. The builder writes the JSON atomically after validating
+the source columns.
 
 The legacy desktop entry point remains `code/Interface.py`. It requires the `ml` and
 `ui` extras and generated indexes. Training and final evaluation must use disjoint

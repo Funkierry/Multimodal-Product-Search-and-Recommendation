@@ -16,11 +16,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from wordcloud import WordCloud
 import pandas as pd
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-import spacy
-from tqdm import tqdm
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from pathlib import Path
 
 
@@ -32,6 +28,7 @@ if str(SRC_DIR) not in sys.path:
 from fyp.artifacts import ArtifactManifest, resolve_image_path
 from fyp.config import ProjectPaths, search_candidate_count
 from fyp.recommendation.collaborative import InteractionRecommender
+from fyp.reviews import load_review_summaries
 from fyp.scoring import similarity_percent
 
 PROJECT_PATHS = ProjectPaths.from_environment()
@@ -293,127 +290,6 @@ class RangeSlider(ctk.CTkFrame):
             self.redraw()
             if self.on_change:
                 self.on_change(self.current_left, self.current_right)
-
-
-# CSV processing: adjective extraction + emotion scoring
-try:
-    nlp = spacy.load("en_core_web_sm")
-except OSError:
-    nlp = None
-    print(
-        "spaCy model 'en_core_web_sm' is unavailable. "
-        "Run 'python -m spacy download en_core_web_sm' to rebuild review summaries."
-    )
-
-analyzer = SentimentIntensityAnalyzer()
-
-def sentiment_analysis_vader(review: str) -> int:
-    if not isinstance(review, str): return 0
-    sentiment_score = analyzer.polarity_scores(review)['compound']
-    if sentiment_score <= -0.05: return -1
-    elif sentiment_score >= 0.05: return 1
-    else: return 0
-
-def extract_adjectives_spacy(review: str):
-    if not isinstance(review, str) or nlp is None: return []
-    doc = nlp(review.lower())
-    adjectives = [token.lemma_ for token in doc if token.pos_ == 'ADJ' and not token.is_stop]
-    return adjectives
-
-def build_reviews_data(csv_path: str, output_json_path: str):
-
-    print(f"Attempting to build reviews data from: {csv_path}")
-    if not os.path.exists(csv_path):
-        print(f"Error: CSV file doesn't exist: {csv_path}")
-        return
-
-    try:
-        data = pd.read_csv(csv_path, on_bad_lines='skip')
-        print(f"Successfully loaded CSV. Columns: {data.columns.tolist()}")
-    except Exception as e:
-        print(f"Error reading CSV file: {e}")
-        return
-
-    required_cols = ["ASIN", "user", "Review"]
-    if not all(col in data.columns for col in required_cols):
-        print(f"Error: CSV necessary columns are missing in it. Need: {required_cols}, In fact, there is: {data.columns.tolist()}")
-        found_cols = {col.lower(): col for col in data.columns}
-        corrected_map = {}
-        missing = []
-        for req_col in required_cols:
-             if req_col.lower() in found_cols:
-                  corrected_map[req_col] = found_cols[req_col.lower()]
-             else:
-                  missing.append(req_col)
-        if len(missing) == 0:
-            print(f"Found columns with different casing. Renaming: {corrected_map}")
-            data.rename(columns={v: k for k, v in corrected_map.items()}, inplace=True)
-        else:
-             print(f"Still missing: {missing}. Please check the CSV structure.")
-             return
-
-    print("Cleaning data...")
-    initial_rows = len(data)
-    data.dropna(subset=['ASIN', 'Review'], inplace=True)
-    data['Review'] = data['Review'].astype(str)
-    data.drop_duplicates(subset=['ASIN', 'user', 'Review'], inplace=True)
-    print(f"Removed {initial_rows - len(data)} rows with missing ASIN/Review or duplicates.")
-
-    print("Performing sentiment analysis...")
-    tqdm.pandas(desc="Analyzing Sentiment")
-    data['Sentiment'] = data['Review'].progress_apply(sentiment_analysis_vader)
-
-    print("Grouping reviews by ASIN...")
-    asin_groups = data.groupby('ASIN')
-    reviews_data = {}
-    num_asins = len(asin_groups)
-
-    print(f"Extracting adjectives and summarizing for {num_asins} ASINs...")
-    for asin, group in tqdm(asin_groups, total=num_asins, desc="Processing ASINs"):
-        all_adjectives = []
-        positive_reviews_adjs = []
-        negative_reviews_adjs = []
-
-        for _, row in group.iterrows():
-            adjs = extract_adjectives_spacy(row['Review'])
-            if row['Sentiment'] == 1:
-                positive_reviews_adjs.extend(adjs)
-            elif row['Sentiment'] == -1:
-                negative_reviews_adjs.extend(adjs)
-            all_adjectives.extend(adjs)
-
-        pos_adj_counter = Counter(positive_reviews_adjs)
-        neg_adj_counter = Counter(negative_reviews_adjs)
-        top_n = 6
-        top_pos = pos_adj_counter.most_common(top_n)
-        top_neg = neg_adj_counter.most_common(top_n)
-        aspects = list(dict.fromkeys([adj for adj, freq in top_pos] + [adj for adj, freq in top_neg]))
-        if not aspects: continue
-
-        positive_scores = []
-        negative_scores = []
-        for aspect in aspects:
-            positive_scores.append(pos_adj_counter.get(aspect, 0))
-            negative_scores.append(neg_adj_counter.get(aspect, 0))
-
-        positive_keywords = [adj for adj, freq in top_pos for _ in range(freq)]
-        negative_keywords = [adj for adj, freq in top_neg for _ in range(freq)]
-
-        reviews_data[asin] = {
-            "aspects": aspects,
-            "positiveScores": positive_scores,
-            "negativeScores": negative_scores,
-            "positiveKeywords": positive_keywords,
-            "negativeKeywords": negative_keywords
-        }
-
-    print(f"Saving processed data to {output_json_path}")
-    try:
-        with open(output_json_path, "w", encoding="utf-8") as jf:
-            json.dump(reviews_data, jf, ensure_ascii=False, indent=2)
-        print(f"Successfully generated reviews_data.json => {output_json_path}")
-    except Exception as e:
-        print(f"Error writing JSON file: {e}")
 
 
 # The search section of Faiss + CLIP
@@ -915,26 +791,13 @@ class ModernSearchApp(ctk.CTk):
         return ["All"] + sorted_categories
 
     def load_reviews_data(self, path):
-        print(f"Loading reviews data from: {path}")
-        if not os.path.exists(path):
-            print(f"Warning: '{path}' not found. Sentiment analysis features will be limited.")
-            csv_file_path = str(PROJECT_PATHS.data_dir / "Dataset_Rec.csv")
-            if os.path.exists(csv_file_path):
-                 print(f"Attempting to build '{path}' from '{csv_file_path}'...")
-                 try:
-                      build_reviews_data(csv_file_path, path)
-                      if os.path.exists(path):
-                           with open(path, "r", encoding="utf-8") as f: return json.load(f)
-                      else: print("Failed to build reviews data."); return {}
-                 except Exception as e:
-                      print(f"Error building reviews data: {e}"); traceback.print_exc(); return {}
-            else: print(f"Source CSV '{csv_file_path}' not found either. Cannot build reviews data."); return {}
-        else:
-            try:
-                with open(path, "r", encoding="utf-8") as f: data = json.load(f)
-                print(f"Successfully loaded reviews data for {len(data)} ASINs.")
-                return data
-            except Exception as e: print(f"Error loading reviews data file: {e}"); return {}
+        try:
+            data = load_review_summaries(path)
+            print(f"Loaded review summaries for {len(data)} ASINs.")
+            return data
+        except (OSError, ValueError) as exc:
+            print(f"Review summaries unavailable: {exc}. Run 'fyp-build-reviews' offline to generate them.")
+            return {}
 
     def load_user_recommendation_data(self):
         """Loads the CSV files needed for user-based recommendations."""
@@ -1840,18 +1703,6 @@ class ModernSearchApp(ctk.CTk):
 def main():
     search_dir = os.environ.get('PRODUCT_SEARCH_DIR', str(PROJECT_ROOT / 'Search'))
     if not os.path.isdir(search_dir): print(f"Error: Search directory not found: {search_dir}"); return
-
-    reviews_json_path = str(PROJECT_ROOT / "reviews_data.json")
-    csv_file_path = str(PROJECT_PATHS.data_dir / "Dataset_Rec.csv")
-    if not os.path.exists(reviews_json_path):
-        print(f"'{reviews_json_path}' not found.")
-        if os.path.exists(csv_file_path):
-            print("Attempting to build reviews data from CSV...")
-            try:
-                build_reviews_data(csv_file_path, reviews_json_path)
-                if not os.path.exists(reviews_json_path): print("Failed to build reviews data. Sentiment features might be unavailable.")
-            except Exception as e: print(f"Error building reviews data: {e}"); traceback.print_exc()
-        else: print(f"Source CSV '{csv_file_path}' also not found. Cannot build reviews data.")
 
     app = None
     try:
