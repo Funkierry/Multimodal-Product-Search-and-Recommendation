@@ -13,7 +13,7 @@ default. Use the environment variables in `.env.example` for local paths.
 
 ## Setup
 
-Use Python 3.10 or 3.11. Create a virtual environment and install the required extras:
+Use Python 3.10 through 3.12. Create a virtual environment and install the required extras:
 
 ```powershell
 py -3.11 -m venv .venv
@@ -91,9 +91,22 @@ set `FYP_DATA_DIR` to the same directory when launching the app.
 Train and evaluate the offline ResNet50+BERT category classifier:
 
 ```powershell
+$env:FYP_DATA_DIR = "D:\path\to\dataset"
+$env:FYP_BATCH_SIZE = "32" # measured at about 3 GB for one training batch on an RTX 4060
+$env:FYP_EPOCHS = "30"
+$env:HF_HOME = (Join-Path (Get-Location) "results\model_cache\hf")
+$env:TORCH_HOME = (Join-Path (Get-Location) "results\model_cache\torch")
+python SIM/classification_audit.py --data-dir $env:FYP_DATA_DIR
 python SIM/SIM.py
 python SIM/SIM_evaluation.py
 ```
+
+Activate the environment containing CUDA-enabled PyTorch first; the `ml` extra also
+requires `transformers`. The classifier uses validation for checkpoint selection and
+evaluates the fixed test partition after training. Test categories absent from train
+count as errors. This command trains on the raw fine-grained categories; it does not
+replicate the historical 11-category experiment. See
+[the evaluation protocol](docs/EVALUATION.md) before comparing results with the PDF.
 
 Start the desktop application after the retrieval artifacts are available:
 

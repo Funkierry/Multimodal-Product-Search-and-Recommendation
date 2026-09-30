@@ -10,10 +10,11 @@ from torchvision.models import resnet50, ResNet50_Weights
 from transformers import BertTokenizer, BertModel
 import torch.nn as nn
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import accuracy_score, balanced_accuracy_score, confusion_matrix, f1_score
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
 from tqdm import tqdm
 import json
 from collections import Counter
+from classification_audit import audit_directory
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -107,8 +108,7 @@ class TestDataset(Dataset):
             if self.transform:
                 image = self.transform(image)
         except Exception as e:
-            print(f"Error loading image {img_path}: {e}")
-            return None
+            raise RuntimeError(f"Error loading image {img_path}: {e}") from e
 
         title = row['title']
         inputs = self.tokenizer(
@@ -160,6 +160,12 @@ def evaluate_model():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
+    checkpoint = torch.load(MODEL_PATH, map_location='cpu', weights_only=True)
+    if checkpoint.get('schema_version') != 2 or 'classes' not in checkpoint:
+        raise ValueError(
+            "This checkpoint predates the fixed train/validation/test protocol; "
+            "retrain before reporting an independent test result."
+        )
     if not os.path.exists(LABEL_MAP_PATH):
         raise FileNotFoundError(f"Label mapping file not found at {LABEL_MAP_PATH}")
 
@@ -168,6 +174,10 @@ def evaluate_model():
         label_encoder = LabelEncoder()
         label_encoder.classes_ = np.asarray(saved_label_info['classes'])
         num_classes = len(label_encoder.classes_)
+    if checkpoint['classes'] != label_encoder.classes_.tolist():
+        raise ValueError("Checkpoint classes do not match the saved label mapping")
+    if checkpoint.get('label_scheme') != 'raw_categoryName_from_updated_csv':
+        raise ValueError("Checkpoint label scheme is incompatible with this evaluator")
     print(f"Loaded label mapping with {num_classes} classes")
 
     print("Loading training set statistics...")
@@ -175,19 +185,19 @@ def evaluate_model():
     print(f"Found {len(training_samples)} categories in training set")
 
     print("Loading test data...")
-    test_df = read_csv_with_encoding(TEST_CSV)
+    frames, audit = audit_directory(BASE_DIR)
+    expected_hashes = {name: item['sha256'] for name, item in audit['files'].items()}
+    if checkpoint.get('source_sha256') != expected_hashes:
+        raise ValueError("Checkpoint source CSV checksums do not match current partitions")
+    test_df = frames['test'].copy()
     print(f"Test data shape: {test_df.shape}")
 
-    unknown_categories = set(test_df['categoryName']) - set(label_encoder.classes_)
-    if unknown_categories:
-        print(f"Warning: Found {len(unknown_categories)} categories in test set that were not in training set.")
-        print("These categories will be skipped during evaluation.")
-        test_df = test_df[~test_df['categoryName'].isin(unknown_categories)]
-
-    test_df['label'] = label_encoder.transform(test_df['categoryName'])
+    known = test_df['categoryName'].isin(label_encoder.classes_)
+    test_df['label'] = -1
+    test_df.loc[known, 'label'] = label_encoder.transform(test_df.loc[known, 'categoryName'])
+    print(f"Unseen-class test rows counted as errors: {(~known).sum()}")
 
     model = FusionModel(num_classes=num_classes).to(device)
-    checkpoint = torch.load(MODEL_PATH, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     print("Model loaded successfully")
@@ -195,7 +205,7 @@ def evaluate_model():
     test_dataset = TestDataset(test_df, BASE_DIR, transform=transform)
     test_loader = DataLoader(
         test_dataset,
-        batch_size=32,
+        batch_size=int(os.environ.get('FYP_BATCH_SIZE', '32')),
         shuffle=False,
         collate_fn=custom_collate,
         num_workers=0
@@ -203,6 +213,7 @@ def evaluate_model():
 
     class_predictions = {name: {'correct': 0, 'total': 0} for name in label_encoder.classes_}
     total_loss = 0
+    loss_batches = 0
     all_preds = []
     all_labels = []
     criterion = nn.CrossEntropyLoss()
@@ -220,25 +231,34 @@ def evaluate_model():
             categories = batch['category_name']
 
             outputs = model(images, input_ids, attention_mask)
-            loss = criterion(outputs, labels)
-            total_loss += loss.item()
+            known_labels = labels >= 0
+            if known_labels.any():
+                loss = criterion(outputs[known_labels], labels[known_labels])
+                total_loss += loss.item()
+                loss_batches += 1
 
             preds = torch.argmax(outputs, dim=1)
 
             for pred, label, category in zip(preds.cpu(), labels.cpu(), categories):
-                class_predictions[category]['total'] += 1
-                if pred == label:
-                    class_predictions[category]['correct'] += 1
+                if label >= 0:
+                    class_predictions[category]['total'] += 1
+                    if pred == label:
+                        class_predictions[category]['correct'] += 1
 
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
 
-    avg_loss = total_loss / len(test_loader)
+    avg_loss = total_loss / loss_batches if loss_batches else None
     accuracy = accuracy_score(all_labels, all_preds)
     f1 = f1_score(all_labels, all_preds, average='weighted')
     macro_f1 = f1_score(all_labels, all_preds, average='macro')
-    balanced_accuracy = balanced_accuracy_score(all_labels, all_preds)
-    confusion = confusion_matrix(all_labels, all_preds, labels=range(num_classes)).tolist()
+    known_true = [label for label in all_labels if label >= 0]
+    known_pred = [pred for label, pred in zip(all_labels, all_preds) if label >= 0]
+    balanced_accuracy = balanced_accuracy_score(known_true, known_pred)
+    confusion = [
+        {'true': int(label), 'predicted': int(pred), 'count': count}
+        for (label, pred), count in sorted(Counter(zip(all_labels, all_preds)).items())
+    ]
 
     min_test_samples = 10
     class_metrics = calculate_metrics(
@@ -262,12 +282,16 @@ def evaluate_model():
             'macro_f1_score': macro_f1,
             'balanced_accuracy': balanced_accuracy,
             'total_test_samples': len(test_df),
+            'evaluated_test_samples': len(all_labels),
+            'unseen_class_rows': int((~known).sum()),
+            'missing_or_unreadable_image_rows': len(test_df) - len(all_labels),
             'total_classes_in_test': len(class_metrics),
             'min_test_samples_threshold': min_test_samples
         },
         'top_200_classes': top_200_classes,
         'class_order': label_encoder.classes_.tolist(),
-        'confusion_matrix': confusion,
+        'confusion_nonzero': confusion,
+        'data_audit': audit,
     }
 
 
@@ -289,7 +313,7 @@ def evaluate_model():
             f.write(line)
 
     print("\nEvaluation Results:")
-    print(f"Average Loss: {avg_loss:.4f}")
+    print(f"Average Loss (known classes): {avg_loss}")
     print(f"Overall Accuracy: {accuracy:.4f}")
     print(f"F1 Score: {f1:.4f}")
     print(f"Macro F1 Score: {macro_f1:.4f}")

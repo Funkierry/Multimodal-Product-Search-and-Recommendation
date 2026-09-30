@@ -4,7 +4,6 @@ import random
 from pathlib import Path
 import torch
 from PIL import Image
-import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 import torch.optim as optim
 import torch.nn as nn
@@ -14,6 +13,9 @@ from transformers import BertTokenizer, BertModel
 from tqdm import tqdm
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+from sklearn.metrics import balanced_accuracy_score
+from collections import Counter
+from classification_audit import audit_directory
 import warnings
 import matplotlib.pyplot as plt
 import logging
@@ -35,10 +37,6 @@ logging.basicConfig(
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # Paths
-BASE_DIR = DATA_DIR
-TRAIN_CSV = DATA_DIR / 'train_updated.csv'
-VAL_CSV = DATA_DIR / 'val_updated.csv'
-TEST_CSV = DATA_DIR / 'test_updated.csv'
 IMG_DIR = DATA_DIR
 
 SEED = int(os.environ.get('FYP_RANDOM_SEED', '42'))
@@ -65,14 +63,6 @@ eval_transform = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-# Read data with specified encoding to fix UnicodeDecodeError
-def read_csv_with_encoding(file_path):
-    try:
-        return pd.read_csv(file_path, encoding='utf-8')
-    except UnicodeDecodeError:
-        logging.warning(f"UTF-8 decoding failed for {file_path}. Trying 'latin1' encoding.")
-        return pd.read_csv(file_path, encoding='latin1')
-
 def prepare_evaluation_split(dataframe, split_name, encoder):
     known = dataframe['categoryName'].isin(encoder.classes_)
     unknown_count = int((~known).sum())
@@ -92,26 +82,43 @@ def check_image_files(dataframe, img_dir, dataset_name):
         if not os.path.exists(img_path):
             missing_files.append(img_path)
     if missing_files:
-        logging.warning(f"{dataset_name} is missing {len(missing_files)} files:")
-        for file in missing_files[:10]:  # Show only first 10 missing files
-            logging.warning(file)
-        if len(missing_files) > 10:
-            logging.warning(f"... Total missing files: {len(missing_files)}")
-    else:
-        logging.info(f"All image files in {dataset_name} exist.")
+        raise FileNotFoundError(
+            f"{dataset_name} is missing {len(missing_files)} images; first: {missing_files[0]}"
+        )
+    logging.info(f"All image files in {dataset_name} exist.")
 
 def load_data_splits():
-    train = read_csv_with_encoding(TRAIN_CSV)
-    validation = read_csv_with_encoding(VAL_CSV)
-    test_data = read_csv_with_encoding(TEST_CSV)
+    frames, audit = audit_directory(DATA_DIR)
+    (RESULTS_DIR / 'classification_data_audit.json').write_text(
+        json.dumps(audit, ensure_ascii=False, indent=2), encoding='utf-8'
+    )
+    if audit.get('alternative_train_labels'):
+        alternate = audit['alternative_train_labels']
+        print(
+            f"WARNING: This run uses raw categories ({audit['splits']['train']['unique_classes']} "
+            f"classes), not train_updated_final.csv ({alternate['unique_classes']} classes). "
+            "Its metrics cannot be compared with the historical coarse-category classifier."
+        )
+    train = frames['train'].dropna(subset=['categoryName']).copy()
+    validation = frames['val']
+    test_data = frames['test'].copy()
+    logging.info("Dropped %s unlabeled training rows", audit['splits']['train']['missing_category_rows'])
 
     encoder = LabelEncoder()
     encoder.fit(train['categoryName'])
     validation = prepare_evaluation_split(validation, "validation", encoder)
-    test_data = prepare_evaluation_split(test_data, "test", encoder)
 
-    for dataframe in (train, validation, test_data):
+    for dataframe in (train, validation):
         dataframe['label'] = encoder.transform(dataframe['categoryName'])
+    known_test = test_data['categoryName'].isin(encoder.classes_)
+    test_data['label'] = -1
+    test_data.loc[known_test, 'label'] = encoder.transform(
+        test_data.loc[known_test, 'categoryName']
+    )
+    logging.info(
+        "Test rows with unseen training categories: %s of %s; counted as incorrect",
+        (~known_test).sum(), len(test_data),
+    )
 
     class_counts = train['label'].value_counts()
     singleton_classes = class_counts[class_counts == 1].index.tolist()
@@ -127,7 +134,7 @@ def load_data_splits():
     check_image_files(train, IMG_DIR, "Training Set")
     check_image_files(validation, IMG_DIR, "Validation Set")
     check_image_files(test_data, IMG_DIR, "Test Set")
-    return train, validation, test_data, encoder
+    return train, validation, test_data, encoder, audit
 
 
 label_encoder = None
@@ -147,8 +154,7 @@ class ProductDataset(Dataset):
 
         # Check if file exists
         if not os.path.exists(img_path):
-            logging.warning(f"Missing file: {img_path}")
-            return None
+            raise FileNotFoundError(img_path)
 
         try:
             # Load image
@@ -156,8 +162,7 @@ class ProductDataset(Dataset):
             if self.transform:
                 image = self.transform(image)
         except Exception as e:
-            logging.error(f"Error loading image {img_path}: {e}")
-            return None
+            raise RuntimeError(f"Error loading image {img_path}: {e}") from e
 
         # Text processing
         title = row['title']
@@ -329,7 +334,7 @@ def plot_training_history(history, results_dir):
     plt.close()
 
 # Training and evaluation function
-def train_and_evaluate(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device):
+def train_and_evaluate(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device, audit):
     history = {
         'train_loss': [],
         'val_loss': [],
@@ -344,7 +349,7 @@ def train_and_evaluate(model, train_loader, val_loader, criterion, optimizer, sc
         'train_macro_f1': [],
         'val_macro_f1': [],
     }
-    best_val_f1 = 0
+    best_val_f1 = -1
     epochs_no_improve = 0
     early_stop_patience = 5  # Early stopping patience
 
@@ -461,9 +466,17 @@ def train_and_evaluate(model, train_loader, val_loader, criterion, optimizer, sc
             best_val_f1 = val_macro_f1
             torch.save(
                 {
-                    'schema_version': 1,
+                    'schema_version': 2,
                     'model_state_dict': model.state_dict(),
                     'classes': label_encoder.classes_.tolist(),
+                    'source_sha256': {
+                        name: item['sha256'] for name, item in audit['files'].items()
+                    },
+                    'seed': SEED,
+                    'batch_size': train_loader.batch_size,
+                    'best_epoch': epoch + 1,
+                    'best_val_macro_f1': float(val_macro_f1),
+                    'label_scheme': 'raw_categoryName_from_updated_csv',
                 },
                 os.path.join(RESULTS_DIR, 'best_model.pth'),
             )
@@ -488,6 +501,7 @@ def test(model, test_loader, criterion, device):
     model.eval()
     test_loss = 0.0
     y_true_test, y_pred_test = [], []
+    evaluated_loss_batches = 0
     test_pbar = tqdm(test_loader, desc="Testing", ncols=100)
     with torch.no_grad():
         for batch in test_pbar:
@@ -502,26 +516,59 @@ def test(model, test_loader, criterion, device):
 
             # Forward pass
             output = model(image, input_ids, attention_mask)
-            loss = criterion(output, label)
-
-            test_loss += loss.item()
+            known = label >= 0
+            if known.any():
+                loss = criterion(output[known], label[known])
+                test_loss += loss.item()
+                evaluated_loss_batches += 1
             y_true_test.extend(label.cpu().numpy())
             y_pred_test.extend(output.argmax(dim=1).cpu().numpy())
 
             # Update progress bar description
-            test_pbar.set_postfix({'Loss': loss.item()})
+            if known.any():
+                test_pbar.set_postfix({'Loss': loss.item()})
 
     # Calculate test loss and metrics
-    avg_test_loss = test_loss / len(test_loader)
+    avg_test_loss = test_loss / evaluated_loss_batches if evaluated_loss_batches else None
     test_accuracy, test_precision, test_recall, test_f1, test_macro_f1 = compute_metrics(y_true_test, y_pred_test)
+    known_pairs = [(truth, pred) for truth, pred in zip(y_true_test, y_pred_test) if truth >= 0]
+    known_true = [truth for truth, _ in known_pairs]
+    known_pred = [pred for _, pred in known_pairs]
+    report = {
+        'total_test_rows': len(test_loader.dataset),
+        'evaluated_rows': len(y_true_test),
+        'unseen_class_rows': y_true_test.count(-1),
+        'missing_or_unreadable_image_rows': len(test_loader.dataset) - len(y_true_test),
+        'accuracy_all_rows': test_accuracy,
+        'weighted_f1_all_rows': test_f1,
+        'macro_f1_all_rows': test_macro_f1,
+        'balanced_accuracy_known_rows': balanced_accuracy_score(known_true, known_pred),
+        'per_class_recall_known_rows': {
+            str(label_encoder.classes_[class_id]): float(recall)
+            for class_id, recall in zip(
+                sorted(set(known_true)),
+                recall_score(
+                    known_true, known_pred, labels=sorted(set(known_true)),
+                    average=None, zero_division=0,
+                ),
+            )
+        },
+        'confusion_nonzero': [
+            {'true': int(truth), 'predicted': int(pred), 'count': count}
+            for (truth, pred), count in sorted(Counter(zip(y_true_test, y_pred_test)).items())
+        ],
+    }
+    (RESULTS_DIR / 'classification_test_report.json').write_text(
+        json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8'
+    )
 
     # Log test results
     logging.info(f"Test Summary:")
-    logging.info(f"Test Loss: {avg_test_loss:.4f} | Accuracy: {test_accuracy:.4f} | Weighted F1: {test_f1:.4f} | Macro F1: {test_macro_f1:.4f}\n")
+    logging.info(f"Test Loss (known classes): {avg_test_loss} | Accuracy: {test_accuracy:.4f} | Weighted F1: {test_f1:.4f} | Macro F1: {test_macro_f1:.4f}\n")
 
     # Print test results
     print(f"\nTest Summary:")
-    print(f"Test Loss: {avg_test_loss:.4f} | Accuracy: {test_accuracy:.4f} | Weighted F1: {test_f1:.4f} | Macro F1: {test_macro_f1:.4f}\n")
+    print(f"Test Loss (known classes): {avg_test_loss} | Accuracy: {test_accuracy:.4f} | Weighted F1: {test_f1:.4f} | Macro F1: {test_macro_f1:.4f}\n")
 
     # Save predictions
     save_predictions(y_true_test, y_pred_test, os.path.join(RESULTS_DIR, 'test_predictions.csv'))
@@ -531,7 +578,7 @@ def test(model, test_loader, criterion, device):
 # Main function
 def main():
     global label_encoder
-    train_df, val_df, test_df, label_encoder = load_data_splits()
+    train_df, val_df, test_df, label_encoder, audit = load_data_splits()
     num_classes = len(label_encoder.classes_)
     print(f"Number of classes: {num_classes}")
 
@@ -543,13 +590,13 @@ def main():
     # Create datasets
     train_dataset = ProductDataset(
         dataframe=train_df,
-        img_dir=IMG_DIR,  # Unified img_dir set to BASE_DIR
+        img_dir=IMG_DIR,
         transform=train_transform,
         tokenizer=tokenizer
     )
     val_dataset = ProductDataset(
         dataframe=val_df,
-        img_dir=IMG_DIR,  # Unified img_dir set to BASE_DIR
+        img_dir=IMG_DIR,
         transform=eval_transform,
         tokenizer=tokenizer
     )
@@ -567,23 +614,26 @@ def main():
     # Adjust num_workers based on the operating system
     num_workers = 4 if os.name != 'nt' else 0  # Windows requires num_workers=0
 
+    batch_size = int(os.environ.get('FYP_BATCH_SIZE', '32'))
+    if batch_size < 1:
+        raise ValueError('FYP_BATCH_SIZE must be positive')
     train_loader = DataLoader(
         train_dataset,
-        batch_size=64,  # Increased batch size to 64
+        batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         collate_fn=custom_collate
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=64,  # Increased batch size to 64
+        batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         collate_fn=custom_collate
     )
     test_loader = DataLoader(
         test_dataset,
-        batch_size=64,
+        batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         collate_fn=custom_collate,
@@ -604,7 +654,6 @@ def main():
         mode='min',
         factor=0.5,
         patience=3,
-        verbose=True,
         min_lr=1e-6
     )
 
@@ -612,7 +661,23 @@ def main():
     print(f"Model initialized. Using device: {device}")
 
     # Train and evaluate
-    num_epochs = 30
+    num_epochs = int(os.environ.get('FYP_EPOCHS', '30'))
+    if num_epochs < 1:
+        raise ValueError('FYP_EPOCHS must be positive')
+    (RESULTS_DIR / 'classification_run_config.json').write_text(
+        json.dumps({
+            'seed': SEED,
+            'batch_size': batch_size,
+            'max_epochs': num_epochs,
+            'device': device,
+            'torch_version': torch.__version__,
+            'source_sha256': {name: item['sha256'] for name, item in audit['files'].items()},
+            'model': 'ResNet50 + bert-base-uncased + attention',
+            'optimizer': 'AdamW(lr=1e-4, weight_decay=1e-2)',
+            'selection_metric': 'validation macro F1',
+            'label_scheme': 'raw_categoryName_from_updated_csv',
+        }, ensure_ascii=False, indent=2), encoding='utf-8'
+    )
     history = train_and_evaluate(
         model=model,
         train_loader=train_loader,
@@ -621,7 +686,8 @@ def main():
         optimizer=optimizer,
         scheduler=scheduler,
         num_epochs=num_epochs,
-        device=device
+        device=device,
+        audit=audit,
     )
 
     # Plot training history

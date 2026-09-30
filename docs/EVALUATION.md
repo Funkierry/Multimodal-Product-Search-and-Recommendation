@@ -10,9 +10,35 @@ training data and reused its validation loader as a test loader.
 2. Fit category mappings and all learned preprocessing on train only.
 3. Use validation for scheduler decisions, early stopping, and model selection.
 4. Load the selected checkpoint and evaluate the test set once.
-5. Report accuracy, weighted F1, macro F1, balanced accuracy, per-class recall, and the
-   confusion matrix. Macro F1 is the primary early-stopping metric because `Others`
-   dominates the current dataset.
+5. Report accuracy, weighted F1, macro F1, balanced accuracy, per-class recall, and a
+   sparse confusion matrix. Macro F1 is the primary early-stopping metric because the
+   current category distribution is highly imbalanced.
+
+The local fixed split contains 159,124 train, 19,900 validation, and 19,886 test
+rows, with no ASIN overlap. The train set has 6,523 classes, including 4,168 with a
+single sample. One train row has no category and is explicitly excluded from
+training. Of the validation and test rows, 521 and 531 respectively have categories
+absent from train. These are never silently discarded from the final test metric:
+they receive the sentinel truth label `-1` and count as incorrect. Validation uses
+only known classes for model selection, and its coverage is recorded separately.
+
+There are **two different label schemes** in the local data. `train_updated.csv`
+uses the 6,523 raw categories, while `train_updated_final.csv` and the current search
+catalog use 11 broad categories. The two train files share all 159,124 ASINs but
+159,119 labels differ. The repaired training script explicitly runs the raw-category
+experiment and warns about this distinction. Its future metrics cannot be compared
+with the historical 11-class result. No independently annotated 11-class validation
+or test CSV is currently present; catalog labels for those partitions are derived
+labels, not independently verified ground truth.
+
+Run `python SIM/classification_audit.py --data-dir path/to/dataset` before training.
+Training writes `results/classification_data_audit.json` with split counts, the
+alternate train label scheme, and source CSV checksums. Final testing writes
+`results/classification_test_report.json` with coverage, metrics, per-class recall,
+and nonzero confusion entries. The 2025 model
+checkpoint lacks the new split-protocol metadata; the standalone evaluator refuses
+to report it as an independent test result. No independent classifier accuracy has
+been reported yet from the repaired training pipeline.
 
 ## Search
 
